@@ -34,7 +34,7 @@ const LEASE_FILE = join(CLIENT_DIR, `${process.pid}.json`);
 const NIX_RESULT_LINK = process.env.DS4_NIX_OUT_LINK ?? join(DS4_DIR, "nix-result");
 
 const SUPPORT_REPO = process.env.DS4_SUPPORT_REPO ?? "https://github.com/shayne/ds4.git";
-const SUPPORT_BRANCH = process.env.DS4_SUPPORT_BRANCH ?? "pi-polish";
+const SUPPORT_BRANCH = process.env.DS4_SUPPORT_BRANCH ?? "main";
 
 const BASE_URL = "http://127.0.0.1:8000";
 const API_BASE_URL = `${BASE_URL}/v1`;
