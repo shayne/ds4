@@ -4,6 +4,8 @@
 /ds4_server_test
 /ds4_test
 /ds4flash.gguf
+/result
+/result-*
 /TODO.md
 /gguf/
 *.o
