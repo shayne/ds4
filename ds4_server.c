@@ -3456,6 +3456,15 @@ static bool openai_sse_finish_live(int fd, const request *r, const char *id,
     return ok;
 }
 
+static bool request_uses_openai_live_stream(const request *r) {
+    return r->stream && r->api == API_OPENAI && r->kind == REQ_CHAT;
+}
+
+static bool request_uses_structured_stream(const request *r) {
+    return r->stream && (r->api == API_ANTHROPIC ||
+                         request_uses_openai_live_stream(r));
+}
+
 static bool final_response(int fd, const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
                            int prompt_tokens, int completion_tokens,
@@ -3917,40 +3926,30 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-
-typedef enum {
-    LOG_DEFAULT,
-    LOG_PREFILL,
-    LOG_GENERATION,
-    LOG_CACHE,
-    LOG_TOOL,
-} log_color;
-
-static const char *log_color_code(log_color color) {
-    switch (color) {
-    case LOG_PREFILL:    return "\033[36m";
-    case LOG_GENERATION: return "\033[32m";
-    case LOG_CACHE:      return "\033[33m";
-    case LOG_TOOL:       return "\033[90m";
-    default:             return "";
-    }
-}
-
-static void server_log(log_color color, const char *fmt, ...) {
+static void server_log(ds4_log_type type, const char *fmt, ...) {
     time_t now = time(NULL);
     struct tm tm;
     localtime_r(&now, &tm);
     char ts[16];
     strftime(ts, sizeof(ts), "%m%d %H:%M:%S", &tm);
 
-    const bool colorize = color != LOG_DEFAULT && isatty(STDERR_FILENO);
-    fprintf(stderr, "%s ", ts);
-    if (colorize) fputs(log_color_code(color), stderr);
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    va_list copy;
+    va_copy(copy, ap);
+    int n = vsnprintf(NULL, 0, fmt, copy);
+    va_end(copy);
+
+    fprintf(stderr, "%s ", ts);
+    if (n < 0) {
+        ds4_log(stderr, type, "%s", fmt);
+    } else {
+        char *line = xmalloc((size_t)n + 1);
+        vsnprintf(line, (size_t)n + 1, fmt, ap);
+        ds4_log(stderr, type, "%s", line);
+        free(line);
+    }
     va_end(ap);
-    if (colorize) fputs("\033[0m", stderr);
     fputc('\n', stderr);
 }
 
@@ -4445,7 +4444,7 @@ static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live) {
         }
         kv_entry e = kc->entry[victim];
         if (unlink(e.path) == 0) {
-            server_log(LOG_CACHE,
+            server_log(DS4_LOG_KVCACHE,
                        "ds4-server: kv cache evicted tokens=%u hits=%u size=%.2f MiB",
                        e.tokens, e.hits, (double)e.file_size / (1024.0 * 1024.0));
             if (total >= e.file_size) total -= e.file_size;
@@ -4465,7 +4464,7 @@ static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb
     memset(kc, 0, sizeof(*kc));
     if (!dir) return false;
     if (!mkdir_p(dir)) {
-        server_log(LOG_DEFAULT, "ds4-server: failed to create KV cache directory %s: %s", dir, strerror(errno));
+        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create KV cache directory %s: %s", dir, strerror(errno));
         return false;
     }
     kc->enabled = true;
@@ -4475,7 +4474,7 @@ static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb
     kc->reject_different_quant = reject_different_quant;
     kc->opt = opt;
     kv_cache_evict(kc, NULL);
-    server_log(LOG_CACHE,
+    server_log(DS4_LOG_KVCACHE,
                "ds4-server: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d)",
                kc->dir,
                (unsigned long long)(kc->budget_bytes / (1024ull * 1024ull)),
@@ -4537,7 +4536,7 @@ static bool kv_cache_existing_compatible(kv_disk_cache *kc, const char *path, in
     kv_entry_free(&e);
     if (!compatible) {
         if (unlink(path) == 0) {
-            server_log(LOG_CACHE, "ds4-server: kv cache replaced incompatible file %s", path);
+            server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache replaced incompatible file %s", path);
         }
         return false;
     }
@@ -4578,7 +4577,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
         live_tokens->len != store_tokens.len ||
         !ds4_tokens_starts_with(live_tokens, &store_tokens))
     {
-        server_log(LOG_CACHE,
+        server_log(DS4_LOG_KVCACHE,
                    "ds4-server: kv cache skipped tokens=%d reason=%s because live checkpoint is at %d",
                    store_tokens.len,
                    reason,
@@ -4598,7 +4597,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     size_t text_len = 0;
     char *text = render_tokens_text(s->engine, &store_tokens, &text_len);
     if (text_len > UINT32_MAX) {
-        server_log(LOG_CACHE, "ds4-server: kv cache skipped tokens=%d because rendered text is too large", store_tokens.len);
+        server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache skipped tokens=%d because rendered text is too large", store_tokens.len);
         free(text);
         free(path);
         ds4_tokens_free(&store_tokens);
@@ -4611,7 +4610,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     const double save_t0 = now_sec();
     FILE *fp = fopen(tmp, "wb");
     if (!fp) {
-        server_log(LOG_CACHE, "ds4-server: kv cache failed to create %s: %s save=%.1f ms",
+        server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache failed to create %s: %s save=%.1f ms",
                    tmp, strerror(errno), (now_sec() - save_t0) * 1000.0);
         free(tmp);
         free(text);
@@ -4643,13 +4642,13 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     }
     const double save_ms = (now_sec() - save_t0) * 1000.0;
     if (!ok) {
-        server_log(LOG_CACHE, "ds4-server: kv cache store failed (%s): %s save=%.1f ms",
+        server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache store failed (%s): %s save=%.1f ms",
                    reason,
                    saved_errno ? strerror(saved_errno) : (err[0] ? err : "unknown error"),
                    save_ms);
         unlink(tmp);
     } else {
-        server_log(LOG_CACHE,
+        server_log(DS4_LOG_KVCACHE,
                    "ds4-server: kv cache stored tokens=%d trimmed=%d reason=%s size=%.2f MiB save=%.1f ms",
                    store_tokens.len,
                    original_len - store_tokens.len,
@@ -4736,11 +4735,11 @@ static int kv_cache_try_load(server *s, const request *req, char **loaded_path_o
         } else {
             ds4_session_invalidate(s->session);
             unlink(path);
-            server_log(LOG_CACHE, "ds4-server: kv cache discarded corrupt token prefix %s", path);
+            server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache discarded corrupt token prefix %s", path);
         }
     } else {
         ds4_session_invalidate(s->session);
-        server_log(LOG_CACHE, "ds4-server: kv cache load failed %s: %s load=%.1f ms",
+        server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache load failed %s: %s load=%.1f ms",
                    path,
                    header_ok ? err : "invalid header",
                    (now_sec() - load_t0) * 1000.0);
@@ -4753,12 +4752,12 @@ static int kv_cache_try_load(server *s, const request *req, char **loaded_path_o
         kc->continued_last_store_tokens = loaded;
         if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
             unlink(path);
-            server_log(LOG_CACHE,
+            server_log(DS4_LOG_KVCACHE,
                        "ds4-server: kv cache hit tokens=%d quant=%u load=%.1f ms consumed file=%s",
                        loaded, hdr.quant_bits, load_ms, path);
         } else {
             kv_cache_touch_file(path, hdr.hits + 1);
-            server_log(LOG_CACHE,
+            server_log(DS4_LOG_KVCACHE,
                        "ds4-server: kv cache hit tokens=%d quant=%u load=%.1f ms file=%s",
                        loaded, hdr.quant_bits, load_ms, path);
         }
@@ -5108,7 +5107,7 @@ static void log_decode_progress(req_kind kind, const char *ctx, int completion,
     const double avg_tps = elapsed > 0.0 ? (double)completion / elapsed : 0.0;
     char flags[80];
     log_flags(flags, sizeof(flags), tools, thinking, dsml_start, dsml_end);
-    server_log(LOG_GENERATION,
+    server_log(DS4_LOG_GENERATION,
                "ds4-server: %s ctx=%s gen=%d%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs",
                kind == REQ_CHAT ? "chat" : "completion",
                ctx,
@@ -5163,7 +5162,7 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls) {
         if (i) buf_putc(&names, ',');
         buf_puts(&names, calls->v[i].name ? calls->v[i].name : "?");
     }
-    server_log(LOG_TOOL,
+    server_log(DS4_LOG_TOOL,
                "ds4-server: tool calls ctx=%s n=%d names=[%s]",
                ctx,
                calls->len,
@@ -5198,7 +5197,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     p->seen = true;
     char flags[64];
     log_flags(flags, sizeof(flags), p->has_tools, false, false, false);
-    server_log(LOG_PREFILL,
+    server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prefill chunk %d/%d (%.1f%%) chunk=%.2f t/s avg=%.2f t/s %.3fs",
                p->kind == REQ_CHAT ? "chat" : "completion",
                p->ctx,
@@ -5258,14 +5257,14 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
     char err[160];
     ds4_session_rewind(s->session, common);
     if (ds4_session_sync(s->session, &canonical, err, sizeof(err)) == 0) {
-        server_log(LOG_CACHE,
+        server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
                    ctx, common, live_len, canonical.len);
         trace_event(s, trace_id,
                     "tool checkpoint canonicalized: common=%d live=%d canonical=%d",
                     common, live_len, canonical.len);
     } else {
-        server_log(LOG_CACHE,
+        server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
                    ctx, common, live_len, canonical.len, err);
         trace_event(s, trace_id, "tool checkpoint canonicalization failed: %s", err);
@@ -5329,7 +5328,7 @@ static void generate_job(server *s, job *j) {
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
     char req_flags[64];
     log_flags(req_flags, sizeof(req_flags), j->req.has_tools, false, false, false);
-    server_log(LOG_PREFILL,
+    server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt start",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
                ctx_span,
@@ -5373,7 +5372,7 @@ static void generate_job(server *s, job *j) {
         return;
     }
     ds4_session_set_progress(s->session, NULL, NULL);
-    server_log(LOG_PREFILL,
+    server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
                ctx_span,
@@ -5390,31 +5389,27 @@ static void generate_job(server *s, job *j) {
              j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
              (unsigned long long)++s->seq);
 
-    bool structured_stream = j->req.stream &&
-        (j->req.api == API_ANTHROPIC || (j->req.kind == REQ_CHAT && j->req.has_tools));
+    bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
     openai_stream openai_live = {0};
-    const bool openai_live_tools = j->req.stream &&
-        j->req.api == API_OPENAI &&
-        j->req.kind == REQ_CHAT &&
-        j->req.has_tools;
+    const bool openai_live_chat = request_uses_openai_live_stream(&j->req);
     if (j->req.stream) {
         if (!sse_headers(j->fd)) {
-            server_log(LOG_GENERATION, "ds4-server: %s ctx=%s sse headers failed", j->req.kind == REQ_CHAT ? "chat" : "completion", ctx_span);
+            server_log(DS4_LOG_GENERATION, "ds4-server: %s ctx=%s sse headers failed", j->req.kind == REQ_CHAT ? "chat" : "completion", ctx_span);
             return;
         }
         if (j->req.api == API_ANTHROPIC &&
             !anthropic_sse_start_live(j->fd, &j->req, id,
                                       j->req.prompt.len, &anthropic_live)) {
-            server_log(LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
+            server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
             return;
         }
         if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
-            server_log(LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
+            server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
             return;
         }
-        if (openai_live_tools) openai_stream_start(&j->req, &openai_live);
+        if (openai_live_chat) openai_stream_start(&j->req, &openai_live);
     }
 
     buf text = {0};
@@ -5541,7 +5536,7 @@ static void generate_job(server *s, job *j) {
                 stop_decode = true;
                 break;
             }
-            if (openai_live_tools &&
+            if (openai_live_chat &&
                 !openai_sse_stream_update(j->fd, &j->req, id,
                                           &openai_live, text.ptr, stream_len,
                                           false)) {
@@ -5679,7 +5674,7 @@ static void generate_job(server *s, job *j) {
             response_ok = anthropic_sse_finish_live(j->fd, &j->req, id, &anthropic_live,
                                                     text.ptr ? text.ptr : "", text.len,
                                                     &parsed_calls, final_finish, completion);
-        } else if (openai_live_tools) {
+        } else if (openai_live_chat) {
             response_ok = openai_sse_finish_live(j->fd, &j->req, id, &openai_live,
                                                  text.ptr ? text.ptr : "", text.len,
                                                  &parsed_calls, final_finish,
@@ -5695,7 +5690,7 @@ static void generate_job(server *s, job *j) {
                           sse_done(j->fd, &j->req, id, j->req.prompt.len, completion, cached);
         }
         if (!response_ok) {
-            server_log(LOG_DEFAULT,
+            server_log(DS4_LOG_DEFAULT,
                        "ds4-server: %s ctx=%s final stream failed",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        ctx_span);
@@ -5721,7 +5716,7 @@ static void generate_job(server *s, job *j) {
                   saw_tool_start,
                   saw_tool_end);
         if (!strcmp(final_finish, "error") && err[0]) {
-            server_log(LOG_GENERATION,
+            server_log(DS4_LOG_GENERATION,
                        "ds4-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
                        ctx_span,
                        completion,
@@ -5731,7 +5726,7 @@ static void generate_job(server *s, job *j) {
                        err,
                        now_sec() - t0);
         } else {
-            server_log(LOG_GENERATION,
+            server_log(DS4_LOG_GENERATION,
                        "ds4-server: chat ctx=%s gen=%d%s%s finish=%s %.3fs",
                        ctx_span,
                        completion,
@@ -5748,7 +5743,7 @@ static void generate_job(server *s, job *j) {
                   false,
                   false);
         if (!strcmp(final_finish, "error") && err[0]) {
-            server_log(LOG_GENERATION,
+            server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        ctx_span,
@@ -5759,7 +5754,7 @@ static void generate_job(server *s, job *j) {
                        err,
                        now_sec() - t0);
         } else {
-            server_log(LOG_GENERATION,
+            server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s gen=%d%s%s finish=%s %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        ctx_span,
@@ -6110,7 +6105,7 @@ static int parse_int_arg(const char *s, const char *opt) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
     if (!s[0] || *end || v <= 0 || v > INT_MAX) {
-        server_log(LOG_DEFAULT, "ds4-server: invalid value for %s: %s", opt, s);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: invalid value for %s: %s", opt, s);
         exit(2);
     }
     return (int)v;
@@ -6120,7 +6115,7 @@ static int parse_nonneg_int_arg(const char *s, const char *opt) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
     if (!s[0] || *end || v < 0 || v > INT_MAX) {
-        server_log(LOG_DEFAULT, "ds4-server: invalid value for %s: %s", opt, s);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: invalid value for %s: %s", opt, s);
         exit(2);
     }
     return (int)v;
@@ -6130,7 +6125,7 @@ static float parse_float_arg(const char *s, const char *opt, float minv, float m
     char *end = NULL;
     float v = strtof(s, &end);
     if (!s[0] || *end || v < minv || v > maxv) {
-        server_log(LOG_DEFAULT, "ds4-server: invalid value for %s: %s", opt, s);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: invalid value for %s: %s", opt, s);
         exit(2);
     }
     return v;
@@ -6138,7 +6133,7 @@ static float parse_float_arg(const char *s, const char *opt, float minv, float m
 
 static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
     if (*i + 1 >= argc) {
-        server_log(LOG_DEFAULT, "ds4-server: missing value for %s", opt);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: missing value for %s", opt);
         exit(2);
     }
     return argv[++(*i)];
@@ -6146,7 +6141,7 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 
 static void log_context_memory(ds4_backend backend, int ctx_size) {
     ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
-    server_log(LOG_DEFAULT,
+    server_log(DS4_LOG_DEFAULT,
                "ds4-server: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)",
                (double)m.total_bytes / (1024.0 * 1024.0),
                ctx_size,
@@ -6308,10 +6303,10 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--cpu") || !strcmp(arg, "--backend")) {
-            server_log(LOG_DEFAULT, "ds4-server: server mode is Metal-only");
+            server_log(DS4_LOG_DEFAULT, "ds4-server: server mode is Metal-only");
             exit(2);
         } else {
-            server_log(LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
+            server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
             usage(stderr);
             exit(2);
         }
@@ -6319,7 +6314,7 @@ static server_config parse_options(int argc, char **argv) {
     if (c.kv_cache.cold_max_tokens > 0 &&
         c.kv_cache.cold_max_tokens < c.kv_cache.min_tokens)
     {
-        server_log(LOG_DEFAULT,
+        server_log(DS4_LOG_DEFAULT,
                    "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
         exit(2);
     }
@@ -6345,7 +6340,7 @@ int main(int argc, char **argv) {
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
-        server_log(LOG_DEFAULT, "ds4-server: failed to create Metal session");
+        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create Metal session");
         ds4_engine_close(engine);
         return 1;
     }
@@ -6366,13 +6361,13 @@ int main(int argc, char **argv) {
     if (cfg.trace_path) {
         s.trace = fopen(cfg.trace_path, "w");
         if (!s.trace) {
-            server_log(LOG_DEFAULT, "ds4-server: failed to open trace file %s: %s",
+            server_log(DS4_LOG_DEFAULT, "ds4-server: failed to open trace file %s: %s",
                        cfg.trace_path, strerror(errno));
             server_close_resources(&s);
             return 1;
         }
         setvbuf(s.trace, NULL, _IONBF, 0);
-        server_log(LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
     }
 
     pthread_t worker;
@@ -6380,7 +6375,7 @@ int main(int argc, char **argv) {
 
     int lfd = listen_on(cfg.host, cfg.port);
     if (lfd < 0) {
-        server_log(LOG_DEFAULT, "ds4-server: failed to listen on %s:%d: %s", cfg.host, cfg.port, strerror(errno));
+        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to listen on %s:%d: %s", cfg.host, cfg.port, strerror(errno));
         pthread_mutex_lock(&s.mu);
         s.stopping = true;
         pthread_cond_broadcast(&s.cv);
@@ -6390,14 +6385,14 @@ int main(int argc, char **argv) {
         return 1;
     }
     g_listen_fd = lfd;
-    server_log(LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
+    server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
 
     while (!g_stop_requested) {
         int fd = accept(lfd, NULL, NULL);
         if (fd < 0) {
             if (g_stop_requested) break;
             if (errno == EINTR) continue;
-            server_log(LOG_DEFAULT, "ds4-server: accept failed: %s", strerror(errno));
+            server_log(DS4_LOG_DEFAULT, "ds4-server: accept failed: %s", strerror(errno));
             continue;
         }
         if (g_stop_requested) {
@@ -6429,7 +6424,7 @@ int main(int argc, char **argv) {
         g_listen_fd = -1;
     }
 
-    server_log(LOG_DEFAULT, "ds4-server: shutdown requested, draining requests");
+    server_log(DS4_LOG_DEFAULT, "ds4-server: shutdown requested, draining requests");
     pthread_mutex_lock(&s.mu);
     s.stopping = true;
     pthread_cond_broadcast(&s.cv);
@@ -6441,7 +6436,7 @@ int main(int argc, char **argv) {
 
     const ds4_tokens *tokens = ds4_session_tokens(s.session);
     if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
-        server_log(LOG_CACHE,
+        server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting current KV cache before shutdown tokens=%d",
                    tokens->len);
         kv_cache_store_current(&s, "shutdown");
@@ -6641,6 +6636,59 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
     close(sv[1]);
 }
 
+static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = false;
+
+    TEST_ASSERT(request_uses_structured_stream(&r));
+    TEST_ASSERT(request_uses_openai_live_stream(&r));
+    TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_title", NULL, NULL));
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw1 = "We need to generate a title";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_title", &st,
+                                         raw1, strlen(raw1), false));
+
+    const char *raw2 =
+        "We need to generate a title</think>Free disk space check";
+    TEST_ASSERT(openai_sse_finish_live(sv[0], &r, "chatcmpl_title", &st,
+                                       raw2, strlen(raw2), NULL,
+                                       "stop", 12, 8, 0));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *role = strstr(out, "\"role\":\"assistant\"");
+    const char *reasoning1 = strstr(out, "\"reasoning_content\":\"We need to generate \"");
+    const char *reasoning2 = strstr(out, "\"reasoning_content\":\"a title\"");
+    const char *content = strstr(out, "\"content\":\"Free disk space check\"");
+    const char *done = strstr(out, "data: [DONE]");
+    TEST_ASSERT(role != NULL);
+    TEST_ASSERT(reasoning1 != NULL);
+    TEST_ASSERT(reasoning2 != NULL);
+    TEST_ASSERT(content != NULL);
+    TEST_ASSERT(done != NULL);
+    TEST_ASSERT(role < reasoning1);
+    TEST_ASSERT(reasoning1 < reasoning2);
+    TEST_ASSERT(reasoning2 < content);
+    TEST_ASSERT(content < done);
+    TEST_ASSERT(strstr(out, "\"content\":\"We need to generate a title") == NULL);
+    TEST_ASSERT(strstr(out, "</think>") == NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_openai_tool_stream_sends_partial_arguments(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -6784,6 +6832,145 @@ static void test_openai_tool_stream_sends_partial_raw_arguments(void) {
     TEST_ASSERT(strstr(out, "\\\"edits\\\":") != NULL);
     TEST_ASSERT(strstr(out, "\"arguments\":\"[1,2,3\"") != NULL);
     TEST_ASSERT(strstr(out, DS4_TOOL_CALLS_START) == NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_tool_stream_holds_partial_dsml_entities(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw_partial =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo &amp";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_entity_tool", &st,
+                                         raw_partial, strlen(raw_partial), false));
+
+    const char *raw_complete =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo &amp; done" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_entity_tool", &st,
+                                         raw_complete, strlen(raw_complete), false));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"arguments\":\"echo \"") != NULL);
+    TEST_ASSERT(strstr(out, "\"arguments\":\"& done\"") != NULL);
+    TEST_ASSERT(strstr(out, "&amp") == NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_tool_stream_holds_partial_utf8_arguments(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char prefix[] =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"write\">\n"
+        DS4_PARAM_START " name=\"content\" string=\"true\">flag ";
+    const char suffix[] =
+        " done" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    const char flag_utf8[] = {(char)0xf0, (char)0x9f, (char)0x9a, (char)0xa9, 0};
+    const char replacement[] = {(char)0xef, (char)0xbf, (char)0xbd, 0};
+
+    buf partial = {0};
+    buf_append(&partial, prefix, strlen(prefix));
+    buf_putc(&partial, (char)0xf0);
+    buf_putc(&partial, (char)0x9f);
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_utf8_tool", &st,
+                                         partial.ptr, partial.len, false));
+
+    buf complete = {0};
+    buf_append(&complete, prefix, strlen(prefix));
+    buf_append(&complete, flag_utf8, 4);
+    buf_append(&complete, suffix, strlen(suffix));
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_utf8_tool", &st,
+                                         complete.ptr, complete.len, false));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"arguments\":\"flag \"") != NULL);
+    TEST_ASSERT(strstr(out, flag_utf8) != NULL);
+    TEST_ASSERT(strstr(out, replacement) == NULL);
+
+    free(out);
+    buf_free(&partial);
+    buf_free(&complete);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_tool_stream_handles_multiple_calls(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"read\">\n"
+        DS4_PARAM_START " name=\"path\" string=\"true\">a.c" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">wc -l a.c" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_multi_tool", &st,
+                                         raw, strlen(raw), false));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "chatcmpl_multi_tool_tool_0") != NULL);
+    TEST_ASSERT(strstr(out, "chatcmpl_multi_tool_tool_1") != NULL);
+    TEST_ASSERT(strstr(out, "\"name\":\"read\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"name\":\"bash\"") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"path\\\":") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"command\\\":") != NULL);
 
     free(out);
     request_free(&r);
@@ -7492,9 +7679,13 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_thinking_and_tool_args_are_schema_ordered();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_openai_tool_stream_sends_incremental_text();
+    test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();
+    test_openai_tool_stream_holds_partial_dsml_entities();
+    test_openai_tool_stream_holds_partial_utf8_arguments();
+    test_openai_tool_stream_handles_multiple_calls();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
