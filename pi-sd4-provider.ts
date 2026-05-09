@@ -31,6 +31,7 @@ const LOCK_DIR = join(DS4_DIR, "lock");
 const STATE_FILE = join(DS4_DIR, "server.json");
 const LOG_FILE = join(DS4_DIR, "log");
 const LEASE_FILE = join(CLIENT_DIR, `${process.pid}.json`);
+const NIX_RESULT_LINK = process.env.DS4_NIX_OUT_LINK ?? join(DS4_DIR, "nix-result");
 
 const SUPPORT_REPO = process.env.DS4_SUPPORT_REPO ?? "https://github.com/mitsuhiko/ds4.git";
 const SUPPORT_BRANCH = process.env.DS4_SUPPORT_BRANCH ?? "pi-polish";
@@ -55,6 +56,7 @@ const PROGRESS_NOTIFY_MS = 750;
 const PROGRESS_MAX_CHARS = 160;
 
 type ModelQuant = "q2" | "q4";
+type BuildMode = "auto" | "nix" | "make";
 
 type ServerState = {
 	managedBy: string;
@@ -100,6 +102,7 @@ let leaseActive = false;
 let watchdogStarted = false;
 let runtimeDisposed = false;
 let shuttingDown = false;
+let resolvedServerBinary: string | undefined;
 let writeSeq = 0;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -172,6 +175,13 @@ function selectedModelQuant(): ModelQuant {
 	throw new Error(
 		`DeepSeek V4 Flash requires at least 128 GB RAM for the q2 model; detected ${ramGb.toFixed(1)} GB`,
 	);
+}
+
+function selectedBuildMode(): BuildMode {
+	const forced = process.env.DS4_BUILD_MODE?.toLowerCase();
+	if (!forced || forced === "auto") return "auto";
+	if (forced === "nix" || forced === "make") return forced;
+	throw new Error(`Invalid DS4_BUILD_MODE=${forced}; expected auto, nix, or make`);
 }
 
 async function ensureDirs(): Promise<void> {
@@ -751,6 +761,15 @@ async function ensureSupportCheckout(onStatus?: StatusCallback): Promise<string>
 	return SUPPORT_DIR;
 }
 
+async function canUseNixBuild(runtimeDir: string): Promise<boolean> {
+	try {
+		await access(join(runtimeDir, "flake.nix"), constants.F_OK);
+	} catch {
+		return false;
+	}
+	return !!(await execCapture("nix", ["--version"], 2_000));
+}
+
 async function resolveRuntimeDirLocked(onStatus?: StatusCallback): Promise<string> {
 	if (resolvedRuntimeDir) return resolvedRuntimeDir;
 
@@ -766,18 +785,59 @@ async function resolveRuntimeDirLocked(onStatus?: StatusCallback): Promise<strin
 	return resolvedRuntimeDir;
 }
 
-async function ensureBuilt(runtimeDir: string, onStatus?: StatusCallback): Promise<void> {
+async function ensureBuiltWithNix(runtimeDir: string, onStatus?: StatusCallback): Promise<void> {
+	onStatus?.("building ds4-server with nix");
+	await mkdir(DS4_DIR, { recursive: true });
+	await runLogged(
+		"nix",
+		["build", "--no-write-lock-file", "--out-link", NIX_RESULT_LINK, `path:${runtimeDir}#default`],
+		runtimeDir,
+		"build ds4-server with nix",
+		{ onStatus, progressPrefix: "building ds4-server with nix" },
+	);
+
+	const outPath = await realpath(NIX_RESULT_LINK);
+	const binary = join(outPath, "bin", "ds4-server");
+	await access(binary, constants.X_OK);
+	resolvedServerBinary = binary;
+}
+
+async function ensureBuiltWithMake(runtimeDir: string, onStatus?: StatusCallback): Promise<void> {
 	try {
 		await access(join(runtimeDir, "ds4-server"), constants.X_OK);
+		resolvedServerBinary = join(runtimeDir, "ds4-server");
 		return;
 	} catch {}
 
 	onStatus?.("building ds4-server");
-	await runLogged("make", ["ds4-server"], runtimeDir, "build ds4-server", {
+	const makeArgs = process.platform === "darwin" ? ["ds4-server", "CC=clang"] : ["ds4-server"];
+	await runLogged("make", makeArgs, runtimeDir, "build ds4-server", {
 		onStatus,
 		progressPrefix: "building ds4-server",
 	});
 	await access(join(runtimeDir, "ds4-server"), constants.X_OK);
+	resolvedServerBinary = join(runtimeDir, "ds4-server");
+}
+
+async function ensureBuilt(runtimeDir: string, onStatus?: StatusCallback): Promise<void> {
+	const forcedBinary = process.env.DS4_SERVER_BINARY;
+	if (forcedBinary) {
+		await access(forcedBinary, constants.X_OK);
+		resolvedServerBinary = forcedBinary;
+		return;
+	}
+
+	const buildMode = selectedBuildMode();
+	if (buildMode !== "make" && (await canUseNixBuild(runtimeDir))) {
+		await ensureBuiltWithNix(runtimeDir, onStatus);
+		return;
+	}
+
+	if (buildMode === "nix") {
+		throw new Error(`DS4_BUILD_MODE=nix requires nix in PATH and ${join(runtimeDir, "flake.nix")}`);
+	}
+
+	await ensureBuiltWithMake(runtimeDir, onStatus);
 }
 
 async function ensureModel(runtimeDir: string, onStatus?: StatusCallback): Promise<void> {
@@ -965,7 +1025,7 @@ async function waitForServerReady(onStatus?: StatusCallback): Promise<void> {
 }
 
 async function startServerLocked(runtimeDir: string): Promise<void> {
-	const binary = process.env.DS4_SERVER_BINARY ?? join(runtimeDir, "ds4-server");
+	const binary = process.env.DS4_SERVER_BINARY ?? resolvedServerBinary ?? join(runtimeDir, "ds4-server");
 	try {
 		await access(binary, constants.X_OK);
 	} catch {
@@ -1148,6 +1208,7 @@ export default function (pi: ExtensionAPI) {
 	startupPromise = undefined;
 	activeSetupChild = undefined;
 	resolvedRuntimeDir = undefined;
+	resolvedServerBinary = undefined;
 
 	registerDs4Provider(pi);
 	registerDs4Command(pi);

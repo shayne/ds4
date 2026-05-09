@@ -304,6 +304,20 @@ Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
 }
 ```
 
+The Pi extension automatically builds the support checkout with Nix when
+`flake.nix` and `nix` are available. It keeps the Nix output rooted at
+`~/.pi/ds4/nix-result`, then launches that wrapped `ds4-server` while keeping
+the support checkout as the working directory so `ds4flash.gguf` still resolves
+normally.
+
+Useful Pi build overrides:
+
+```sh
+DS4_BUILD_MODE=nix pi        # require the Nix build path
+DS4_BUILD_MODE=make pi       # force the Makefile build path
+DS4_SERVER_BINARY=/path/to/ds4-server pi
+```
+
 For **Claude Code**, use the Anthropic-compatible endpoint. A wrapper like this
 matches the local `~/bin/claude-ds4` setup:
 
