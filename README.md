@@ -4,12 +4,19 @@ This repository is some slop patches by me on top of `ds4.c` to experiment
 with better streaming (can stream tool parameter calls) and an out-of-the-box
 experience for pi (downloads the model, compiles ds4, manages lifecycle).
 
-You can install this repository URL to get both the pi extension and `ds4`
-going: it downloads the model automatically, manages the server for you, and
-does not require editing `models.json`.
+This fork lives at `https://github.com/shayne/ds4` and includes Nix packaging
+for the native binaries. You can install it with Pi to get both the extension
+and `ds4` going: it downloads the model automatically, manages the server for
+you, and does not require editing `models.json`.
 
 ```sh
-pi install https://github.com/mitsuhiko/ds4
+pi install https://github.com/shayne/ds4
+```
+
+If you run Pi through nixpkgs, the package is `pi-coding-agent`:
+
+```sh
+nix run nixpkgs#pi-coding-agent -- install https://github.com/shayne/ds4
 ```
 
 <hr>
@@ -247,7 +254,42 @@ For **opencode**, add a provider and agent entry to
 }
 ```
 
-For **Pi**, add a provider to `~/.pi/agent/models.json`:
+For **Pi**, the extension registers the `ds4/deepseek-v4-flash` model
+automatically. To install this fork:
+
+```sh
+pi install https://github.com/shayne/ds4
+```
+
+Or, without a globally installed `pi` command:
+
+```sh
+nix run nixpkgs#pi-coding-agent -- install https://github.com/shayne/ds4
+```
+
+For local development from a checkout, symlink the extension and runtime
+checkout, then run Pi through nixpkgs:
+
+```sh
+git clone https://github.com/shayne/ds4
+cd ds4
+./install-pi-extension-local.sh
+DS4_BUILD_MODE=nix nix run nixpkgs#pi-coding-agent -- --model ds4/deepseek-v4-flash
+```
+
+The local installer creates:
+
+- `~/.pi/agent/extensions/pi-sd4-provider.ts`
+- `~/.pi/ds4/support`
+
+If `~/.pi/ds4/support` already points somewhere else, keep it and force this
+checkout for one run:
+
+```sh
+DS4_RUNTIME_DIR=$PWD DS4_BUILD_MODE=nix nix run nixpkgs#pi-coding-agent -- --model ds4/deepseek-v4-flash
+```
+
+The manual provider equivalent in `~/.pi/agent/models.json` is:
 
 ```json
 {
